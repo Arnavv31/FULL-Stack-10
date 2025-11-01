@@ -1,0 +1,531 @@
+/***********************************************************************
+ * Blog Platform (single-file)
+ * Backend: Express + Mongoose + JWT + Socket.IO
+ * Frontend: Single-page HTML + JS served by Express
+ *
+ * Usage:
+ * 1. Make sure MongoDB is running locally (mongod).
+ * 2. Save this file as blog-platform.js
+ * 3. Install deps:
+ *    npm install express mongoose bcrypt jsonwebtoken cors socket.io
+ * 4. Start:
+ *    node blog-platform.js
+ * 5. Open http://localhost:5000
+ ***********************************************************************/
+
+const express = require('express');
+const mongoose = require('mongoose');
+const bcrypt = require('bcrypt');
+const jwt = require('jsonwebtoken');
+const cors = require('cors');
+const http = require('http');
+
+const app = express();
+app.use(express.json());
+app.use(cors());
+
+// JWT secret (in production put in env)
+const JWT_SECRET = 'supersecret_jwt_key_change_me';
+
+// ---------- MongoDB Connection ----------
+mongoose.connect('mongodb://127.0.0.1:27017/blog_platform', {
+  useNewUrlParser: true,
+  useUnifiedTopology: true
+})
+.then(() => console.log('✅ MongoDB connected'))
+.catch(err => { console.error('MongoDB error', err); process.exit(1); });
+
+// ---------- Mongoose Schemas ----------
+const userSchema = new mongoose.Schema({
+  username: { type: String, unique: true, required: true },
+  displayName: { type: String, default: '' },
+  passwordHash: { type: String, required: true },
+  bio: { type: String, default: '' },
+}, { timestamps: true });
+
+const commentSchema = new mongoose.Schema({
+  author: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+  text: { type: String, required: true },
+  createdAt: { type: Date, default: Date.now }
+});
+
+const postSchema = new mongoose.Schema({
+  author: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+  title: { type: String, required: true },
+  body: { type: String, required: true },
+  comments: [commentSchema],
+}, { timestamps: true });
+
+const User = mongoose.model('User', userSchema);
+const Post = mongoose.model('Post', postSchema);
+
+// ---------- Helper: Auth Middleware ----------
+function authMiddleware(req, res, next) {
+  const authHeader = req.headers['authorization'];
+  if (!authHeader) return res.status(401).json({ error: 'No token provided' });
+  const token = authHeader.split(' ')[1];
+  if (!token) return res.status(401).json({ error: 'Malformed auth header' });
+
+  jwt.verify(token, JWT_SECRET, (err, decoded) => {
+    if (err) return res.status(401).json({ error: 'Invalid token' });
+    req.userId = decoded.id;
+    next();
+  });
+}
+
+// ---------- API Routes ----------
+
+// --- Auth: Register
+app.post('/api/auth/register', async (req, res) => {
+  try {
+    const { username, password, displayName, bio } = req.body;
+    if (!username || !password) return res.status(400).json({ error: 'username & password required' });
+    const existing = await User.findOne({ username });
+    if (existing) return res.status(400).json({ error: 'Username already taken' });
+
+    const passwordHash = await bcrypt.hash(password, 10);
+    const user = new User({ username, passwordHash, displayName: displayName || username, bio: bio || '' });
+    await user.save();
+    const token = jwt.sign({ id: user._id }, JWT_SECRET, { expiresIn: '7d' });
+    res.json({ token, user: { id: user._id, username: user.username, displayName: user.displayName, bio: user.bio } });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Registration failed' });
+  }
+});
+
+// --- Auth: Login
+app.post('/api/auth/login', async (req, res) => {
+  try {
+    const { username, password } = req.body;
+    const user = await User.findOne({ username });
+    if (!user) return res.status(400).json({ error: 'Invalid credentials' });
+    const ok = await bcrypt.compare(password, user.passwordHash);
+    if (!ok) return res.status(400).json({ error: 'Invalid credentials' });
+    const token = jwt.sign({ id: user._id }, JWT_SECRET, { expiresIn: '7d' });
+    res.json({ token, user: { id: user._id, username: user.username, displayName: user.displayName, bio: user.bio } });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Login failed' });
+  }
+});
+
+// --- Get current user profile
+app.get('/api/me', authMiddleware, async (req, res) => {
+  const user = await User.findById(req.userId).select('-passwordHash');
+  res.json(user);
+});
+
+// --- Update profile
+app.put('/api/me', authMiddleware, async (req, res) => {
+  try {
+    const { displayName, bio } = req.body;
+    const user = await User.findById(req.userId);
+    if (!user) return res.status(404).json({ error: 'Not found' });
+    if (displayName !== undefined) user.displayName = displayName;
+    if (bio !== undefined) user.bio = bio;
+    await user.save();
+    res.json({ message: 'Profile updated' });
+  } catch (err) {
+    res.status(500).json({ error: 'Update failed' });
+  }
+});
+
+// --- Posts: Create
+app.post('/api/posts', authMiddleware, async (req, res) => {
+  try {
+    const { title, body } = req.body;
+    if (!title || !body) return res.status(400).json({ error: 'title & body required' });
+    const post = new Post({ author: req.userId, title, body, comments: [] });
+    await post.save();
+    const populated = await Post.findById(post._id).populate('author', 'username displayName');
+    io.emit('newPost', populated); // notify clients
+    res.json(populated);
+  } catch (err) {
+    res.status(500).json({ error: 'Create post failed' });
+  }
+});
+
+// --- Posts: Read all
+app.get('/api/posts', async (req, res) => {
+  const posts = await Post.find().sort({ createdAt: -1 }).populate('author', 'username displayName').lean();
+  res.json(posts);
+});
+
+// --- Posts: Read single
+app.get('/api/posts/:id', async (req, res) => {
+  const post = await Post.findById(req.params.id).populate('author', 'username displayName').lean();
+  if (!post) return res.status(404).json({ error: 'Post not found' });
+  res.json(post);
+});
+
+// --- Posts: Update (only author)
+app.put('/api/posts/:id', authMiddleware, async (req, res) => {
+  try {
+    const post = await Post.findById(req.params.id);
+    if (!post) return res.status(404).json({ error: 'Post not found' });
+    if (post.author.toString() !== req.userId) return res.status(403).json({ error: 'Not authorized' });
+    const { title, body } = req.body;
+    if (title !== undefined) post.title = title;
+    if (body !== undefined) post.body = body;
+    await post.save();
+    const populated = await Post.findById(post._id).populate('author', 'username displayName');
+    io.emit('updatePost', populated);
+    res.json(populated);
+  } catch (err) {
+    res.status(500).json({ error: 'Update failed' });
+  }
+});
+
+// --- Posts: Delete (only author)
+app.delete('/api/posts/:id', authMiddleware, async (req, res) => {
+  try {
+    const post = await Post.findById(req.params.id);
+    if (!post) return res.status(404).json({ error: 'Post not found' });
+    if (post.author.toString() !== req.userId) return res.status(403).json({ error: 'Not authorized' });
+    await post.remove();
+    io.emit('deletePost', { id: req.params.id });
+    res.json({ message: 'Deleted' });
+  } catch (err) {
+    res.status(500).json({ error: 'Delete failed' });
+  }
+});
+
+// --- Comments: Add comment to post
+app.post('/api/posts/:id/comments', authMiddleware, async (req, res) => {
+  try {
+    const { text } = req.body;
+    if (!text) return res.status(400).json({ error: 'text required' });
+    const post = await Post.findById(req.params.id);
+    if (!post) return res.status(404).json({ error: 'Post not found' });
+    const comment = { author: req.userId, text, createdAt: new Date() };
+    post.comments.push(comment);
+    await post.save();
+    const populated = await Post.findById(post._id)
+      .populate('author', 'username displayName')
+      .populate('comments.author', 'username displayName');
+    // emit new comment event for real-time update
+    io.emit('newComment', { postId: post._id.toString(), comment: populated.comments[populated.comments.length - 1] });
+    res.json(populated);
+  } catch (err) {
+    res.status(500).json({ error: 'Add comment failed' });
+  }
+});
+
+// --- Comments: Delete comment (only comment author or post author can remove)
+app.delete('/api/posts/:postId/comments/:commentId', authMiddleware, async (req, res) => {
+  try {
+    const { postId, commentId } = req.params;
+    const post = await Post.findById(postId);
+    if (!post) return res.status(404).json({ error: 'Post not found' });
+    const comment = post.comments.id(commentId);
+    if (!comment) return res.status(404).json({ error: 'Comment not found' });
+    const isCommentAuthor = comment.author.toString() === req.userId;
+    const isPostAuthor = post.author.toString() === req.userId;
+    if (!isCommentAuthor && !isPostAuthor) return res.status(403).json({ error: 'Not authorized' });
+    comment.remove();
+    await post.save();
+    io.emit('deleteComment', { postId, commentId });
+    res.json({ message: 'Comment deleted' });
+  } catch (err) {
+    res.status(500).json({ error: 'Delete comment failed' });
+  }
+});
+
+// ---------- Minimal Frontend (single page) ----------
+const frontendHTML = `
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Blog Platform</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 20px; background:#f7f7f7; }
+    .app { max-width: 1000px; margin: 0 auto; display:flex; gap:20px; }
+    .col { background:white; padding:16px; border-radius:8px; box-shadow:0 2px 6px rgba(0,0,0,0.08); }
+    .left { flex: 1; }
+    .right { width: 320px; }
+    input, textarea { width:100%; padding:8px; margin:6px 0; box-sizing:border-box; }
+    button { padding:8px 12px; margin:6px 4px 0 0; cursor:pointer; }
+    .post { border-bottom: 1px solid #eee; padding:12px 0; }
+    .comment { font-size: 0.9rem; color:#333; margin-left: 8px; }
+    .meta { font-size:0.85rem;color:#666; }
+    .small { font-size:0.85rem;color:#666;margin-top:6px; }
+    .topbar { display:flex; justify-content:space-between; align-items:center; margin-bottom:12px; }
+    .btn-danger { background:#e74c3c;color:white;border:none;padding:6px 10px;border-radius:4px; }
+    .btn-primary { background:#2d86ff;color:white;border:none;padding:6px 10px;border-radius:4px; }
+  </style>
+</head>
+<body>
+  <div class="topbar">
+    <h1>Simple Blog Platform</h1>
+    <div id="authArea"></div>
+  </div>
+
+  <div class="app">
+    <div class="col left">
+      <h2>Create Post</h2>
+      <input id="postTitle" placeholder="Title" />
+      <textarea id="postBody" rows="4" placeholder="Write your post..."></textarea>
+      <button onclick="createPost()" class="btn-primary">Publish</button>
+      <div class="small">Note: You must be logged in to create posts.</div>
+
+      <hr/>
+
+      <h2>Posts</h2>
+      <div id="posts"></div>
+    </div>
+
+    <div class="col right">
+      <div id="profileArea">
+        <h3>Profile</h3>
+        <div id="profileDisplay"></div>
+      </div>
+
+      <hr/>
+
+      <div id="authForms">
+        <h3>Register</h3>
+        <input id="regUsername" placeholder="Username" />
+        <input id="regPassword" placeholder="Password" type="password" />
+        <input id="regDisplay" placeholder="Display Name (optional)" />
+        <button onclick="register()">Register</button>
+
+        <h3 style="margin-top:12px;">Login</h3>
+        <input id="loginUsername" placeholder="Username" />
+        <input id="loginPassword" placeholder="Password" type="password" />
+        <button onclick="login()">Login</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="/socket.io/socket.io.js"></script>
+  <script>
+    const API = '/api';
+    let token = localStorage.getItem('jwt') || '';
+    const socket = io();
+
+    // auth area
+    function renderAuthArea(user) {
+      const authArea = document.getElementById('authArea');
+      if (user) {
+        authArea.innerHTML = \`<span>\${user.displayName} (@\${user.username})</span> <button onclick="logout()">Logout</button>\`;
+      } else {
+        authArea.innerHTML = \`<a href="#authForms">Login / Register</a>\`;
+      }
+    }
+
+    async function fetchProfile() {
+      if (!token) {
+        document.getElementById('profileDisplay').innerHTML = '<div>Please login or register.</div>';
+        renderAuthArea(null);
+        return;
+      }
+      try {
+        const res = await fetch(API + '/me', { headers: { Authorization: 'Bearer ' + token }});
+        if (!res.ok) { throw new Error('Not authorized'); }
+        const data = await res.json();
+        document.getElementById('profileDisplay').innerHTML = \`
+          <div><strong>\${data.displayName}</strong> (@\${data.username})</div>
+          <div class="small">\${data.bio || ''}</div>
+          <div style="margin-top:8px;">
+            <input id="editDisplay" placeholder="Display name" value="\${data.displayName}" />
+            <input id="editBio" placeholder="Bio" value="\${data.bio || ''}" />
+            <button onclick="updateProfile()">Update</button>
+          </div>
+        \`;
+        renderAuthArea(data);
+      } catch (err) {
+        token = '';
+        localStorage.removeItem('jwt');
+        document.getElementById('profileDisplay').innerHTML = '<div>Please login or register.</div>';
+        renderAuthArea(null);
+      }
+    }
+
+    async function register() {
+      try {
+        const username = document.getElementById('regUsername').value.trim();
+        const password = document.getElementById('regPassword').value;
+        const displayName = document.getElementById('regDisplay').value.trim();
+        if (!username || !password) return alert('username & password required');
+        const res = await fetch(API + '/auth/register', { method: 'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({username, password, displayName})});
+        const data = await res.json();
+        if (res.ok) {
+          token = data.token; localStorage.setItem('jwt', token);
+          fetchProfile(); loadPosts();
+          alert('Registered & logged in');
+        } else alert(data.error || 'Register failed');
+      } catch (err) { console.error(err); alert('Register failed'); }
+    }
+
+    async function login() {
+      try {
+        const username = document.getElementById('loginUsername').value.trim();
+        const password = document.getElementById('loginPassword').value;
+        if (!username || !password) return alert('username & password required');
+        const res = await fetch(API + '/auth/login', { method: 'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({username, password})});
+        const data = await res.json();
+        if (res.ok) {
+          token = data.token; localStorage.setItem('jwt', token);
+          fetchProfile(); loadPosts();
+          alert('Logged in');
+        } else alert(data.error || 'Login failed');
+      } catch (err) { console.error(err); alert('Login failed'); }
+    }
+
+    function logout() {
+      token = ''; localStorage.removeItem('jwt'); fetchProfile(); loadPosts();
+    }
+
+    async function updateProfile() {
+      const displayName = document.getElementById('editDisplay').value;
+      const bio = document.getElementById('editBio').value;
+      const res = await fetch(API + '/me', { method: 'PUT', headers:{'Content-Type':'application/json','Authorization':'Bearer ' + token}, body: JSON.stringify({displayName, bio})});
+      if (res.ok) { alert('Profile updated'); fetchProfile(); }
+    }
+
+    // Posts
+    async function createPost() {
+      const title = document.getElementById('postTitle').value.trim();
+      const body = document.getElementById('postBody').value.trim();
+      if (!title || !body) return alert('title & body required');
+      const res = await fetch(API + '/posts', { method: 'POST', headers: {'Content-Type':'application/json','Authorization':'Bearer ' + token}, body: JSON.stringify({title, body})});
+      const data = await res.json();
+      if (res.ok) { document.getElementById('postTitle').value=''; document.getElementById('postBody').value=''; loadPosts(); } else alert(data.error || 'Create failed');
+    }
+
+    async function loadPosts() {
+      const res = await fetch(API + '/posts');
+      const posts = await res.json();
+      const container = document.getElementById('posts');
+      container.innerHTML = '';
+      posts.forEach(p => {
+        const div = document.createElement('div');
+        div.className = 'post';
+        const authoredByMe = (getUserIdFromToken() === (p.author && p.author._id));
+        div.innerHTML = \`
+          <h3>\${escapeHtml(p.title)}</h3>
+          <div class="meta">by \${p.author ? escapeHtml(p.author.displayName || p.author.username) : 'Unknown'} - \${new Date(p.createdAt).toLocaleString()}</div>
+          <p>\${escapeHtml(p.body)}</p>
+          <div>
+            \${authButtons(p._id, authoredByMe)}
+          </div>
+          <div style="margin-top:8px;">
+            <strong>Comments (\${p.comments.length})</strong>
+            <div id="comments-\${p._id}">\${renderComments(p)}</div>
+            <div style="margin-top:6px;">
+              <input id="commentText-\${p._id}" placeholder="Write a comment..." />
+              <button onclick="addComment('\${p._id}')">Comment</button>
+            </div>
+          </div>
+        \`;
+        container.appendChild(div);
+      });
+    }
+
+    function authButtons(postId, authoredByMe) {
+      let html = '';
+      if (token) {
+        if (authoredByMe) {
+          html += '<button onclick="editPost(\\'' + postId + '\\')">Edit</button>';
+          html += '<button class="btn-danger" onclick="deletePost(\\'' + postId + '\\')">Delete</button>';
+        }
+      } else {
+        html += '<span class="small">Login to manage posts</span>';
+      }
+      return html;
+    }
+
+    function renderComments(p) {
+      return p.comments.map(c => {
+        const author = c.author ? (c.author.displayName || c.author.username) : 'Unknown';
+        const canDelete = (token && (getUserIdFromToken() === (c.author && c.author._id) || getUserIdFromToken() === (p.author && p.author._id)));
+        return '<div style="margin-top:6px;"><strong>' + escapeHtml(author) + '</strong>: ' + escapeHtml(c.text) + (canDelete ? ' <button onclick="deleteComment(\\'' + p._id + '\\', \\'' + c._id + '\\')">Delete</button>' : '') + '</div>';
+      }).join('');
+    }
+
+    async function editPost(postId) {
+      const title = prompt('New title?');
+      const body = prompt('New body?');
+      if (title === null || body === null) return;
+      const res = await fetch(API + '/posts/' + postId, { method: 'PUT', headers: {'Content-Type':'application/json','Authorization':'Bearer ' + token}, body: JSON.stringify({title, body})});
+      const data = await res.json();
+      if (res.ok) loadPosts(); else alert(data.error || 'Edit failed');
+    }
+
+    async function deletePost(postId) {
+      if (!confirm('Delete post?')) return;
+      const res = await fetch(API + '/posts/' + postId, { method: 'DELETE', headers: {'Authorization': 'Bearer ' + token} });
+      const data = await res.json();
+      if (res.ok) loadPosts(); else alert(data.error || 'Delete failed');
+    }
+
+    async function addComment(postId) {
+      const text = document.getElementById('commentText-' + postId).value.trim();
+      if (!text) return;
+      const res = await fetch(API + '/posts/' + postId + '/comments', { method: 'POST', headers: {'Content-Type':'application/json','Authorization':'Bearer ' + token}, body: JSON.stringify({text})});
+      const data = await res.json();
+      if (res.ok) {
+        document.getElementById('commentText-' + postId).value = '';
+        loadPosts();
+      } else alert(data.error || 'Comment failed');
+    }
+
+    async function deleteComment(postId, commentId) {
+      if (!confirm('Delete comment?')) return;
+      const res = await fetch(API + '/posts/' + postId + '/comments/' + commentId, { method: 'DELETE', headers: {'Authorization':'Bearer ' + token} });
+      const data = await res.json();
+      if (res.ok) loadPosts(); else alert(data.error || 'Delete failed');
+    }
+
+    // Utilities
+    function escapeHtml(s) {
+      if (!s) return '';
+      return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+    }
+    function getUserIdFromToken() {
+      if (!token) return null;
+      try {
+        const payload = JSON.parse(atob(token.split('.')[1]));
+        return payload.id;
+      } catch (e) { return null; }
+    }
+
+    // Real-time: listen for events
+    socket.on('connect', () => console.log('connected to socket.io'));
+    socket.on('newComment', (data) => {
+      // load posts or partially update - simplest: reload all posts
+      loadPosts();
+    });
+    socket.on('newPost', (p) => loadPosts());
+    socket.on('updatePost', (p) => loadPosts());
+    socket.on('deletePost', (d) => loadPosts());
+    socket.on('deleteComment', (d) => loadPosts());
+
+    // init
+    fetchProfile();
+    loadPosts();
+  </script>
+</body>
+</html>
+`;
+
+// Serve frontend
+app.get('/', (req, res) => res.send(frontendHTML));
+
+// ---------- Create HTTP server with Socket.IO ----------
+const server = http.createServer(app);
+const { Server } = require('socket.io');
+const io = new Server(server);
+
+// Broadcast events from server logic already call io.emit(...)
+// Socket connection logging (optional)
+io.on('connection', (socket) => {
+  console.log('Socket connected:', socket.id);
+  socket.on('disconnect', () => console.log('Socket disconnected:', socket.id));
+});
+
+// ---------- Start server ----------
+const PORT = process.env.PORT || 5000;
+server.listen(PORT, () => console.log('✅ Blog platform running at http://localhost:' + PORT));

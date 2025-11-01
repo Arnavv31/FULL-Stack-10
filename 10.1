@@ -1,0 +1,174 @@
+/**********************************************************************************************
+* 🖥️ Full Stack Todo Application
+* Backend: Node.js + Express + MongoDB (Mongoose)
+* Frontend: React (served by the backend)
+**********************************************************************************************/
+
+/*******************************
+ * 📦 1. BACKEND (Node.js + Express + MongoDB)
+ *******************************/
+
+// Import dependencies
+const express = require('express');
+const mongoose = require('mongoose');
+const path = require('path');
+const cors = require('cors');
+
+// Initialize app
+const app = express();
+app.use(express.json());
+app.use(cors());
+
+// MongoDB connection
+mongoose.connect('mongodb://127.0.0.1:27017/todoapp', {
+    useNewUrlParser: true,
+    useUnifiedTopology: true
+})
+.then(() => console.log('✅ MongoDB Connected'))
+.catch(err => console.error('❌ MongoDB Connection Error:', err));
+
+// Define Todo schema and model
+const todoSchema = new mongoose.Schema({
+    text: { type: String, required: true },
+    completed: { type: Boolean, default: false }
+});
+
+const Todo = mongoose.model('Todo', todoSchema);
+
+// API Routes
+
+// ➕ Create a new todo
+app.post('/api/todos', async (req, res) => {
+    try {
+        const todo = new Todo({ text: req.body.text });
+        await todo.save();
+        res.status(201).json(todo);
+    } catch (err) {
+        res.status(500).json({ error: 'Failed to create todo' });
+    }
+});
+
+// 📋 Get all todos
+app.get('/api/todos', async (req, res) => {
+    const todos = await Todo.find();
+    res.json(todos);
+});
+
+// ✏️ Update todo (mark complete or edit text)
+app.put('/api/todos/:id', async (req, res) => {
+    try {
+        const todo = await Todo.findByIdAndUpdate(
+            req.params.id,
+            { $set: req.body },
+            { new: true }
+        );
+        res.json(todo);
+    } catch (err) {
+        res.status(500).json({ error: 'Failed to update todo' });
+    }
+});
+
+// ❌ Delete todo
+app.delete('/api/todos/:id', async (req, res) => {
+    try {
+        await Todo.findByIdAndDelete(req.params.id);
+        res.json({ message: 'Todo deleted' });
+    } catch (err) {
+        res.status(500).json({ error: 'Failed to delete todo' });
+    }
+});
+
+/*******************************
+ * 🎨 2. FRONTEND (React App)
+ *******************************/
+const frontendHTML = `
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Todo App</title>
+<style>
+  body { font-family: Arial; background: #f2f2f2; text-align: center; }
+  h1 { color: #333; }
+  .todo-container { max-width: 400px; margin: 20px auto; background: white; padding: 20px; border-radius: 10px; box-shadow: 0 0 10px rgba(0,0,0,0.1); }
+  input { padding: 10px; width: 70%; margin-right: 5px; }
+  button { padding: 10px; cursor: pointer; background-color: #007bff; color: white; border: none; border-radius: 5px; }
+  ul { list-style: none; padding: 0; }
+  li { display: flex; justify-content: space-between; align-items: center; padding: 8px; border-bottom: 1px solid #ddd; }
+  li.completed { text-decoration: line-through; color: gray; }
+</style>
+</head>
+<body>
+<div class="todo-container">
+  <h1>📝 Todo List</h1>
+  <input id="todoInput" placeholder="Add new todo..." />
+  <button onclick="addTodo()">Add</button>
+  <ul id="todoList"></ul>
+</div>
+
+<script>
+const API_URL = '/api/todos';
+
+// Fetch all todos
+async function fetchTodos() {
+  const res = await fetch(API_URL);
+  const todos = await res.json();
+  const list = document.getElementById('todoList');
+  list.innerHTML = '';
+  todos.forEach(todo => {
+    const li = document.createElement('li');
+    li.className = todo.completed ? 'completed' : '';
+    li.innerHTML = \`
+      <span onclick="toggleComplete('\${todo._id}', \${!todo.completed})">\${todo.text}</span>
+      <button onclick="deleteTodo('\${todo._id}')">Delete</button>
+    \`;
+    list.appendChild(li);
+  });
+}
+
+// Add todo
+async function addTodo() {
+  const input = document.getElementById('todoInput');
+  const text = input.value.trim();
+  if (!text) return;
+  await fetch(API_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ text })
+  });
+  input.value = '';
+  fetchTodos();
+}
+
+// Toggle complete
+async function toggleComplete(id, completed) {
+  await fetch(\`\${API_URL}/\${id}\`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ completed })
+  });
+  fetchTodos();
+}
+
+// Delete todo
+async function deleteTodo(id) {
+  await fetch(\`\${API_URL}/\${id}\`, { method: 'DELETE' });
+  fetchTodos();
+}
+
+// Initial load
+fetchTodos();
+</script>
+</body>
+</html>
+`;
+
+// Serve frontend
+app.get('/', (req, res) => res.send(frontendHTML));
+
+/*******************************
+ * 🚀 3. SERVER START
+ *******************************/
+const PORT = 5000;
+app.listen(PORT, () => console.log(\`✅ Server running on http://localhost:\${PORT}\`));
